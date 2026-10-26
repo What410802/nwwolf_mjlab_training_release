@@ -768,7 +768,7 @@ def _part2_terrain_state(
             wall_front = 2.44
             wall_h = 0.10 + 0.30 * difficulty
         success |= m & (wx_min >= wall_front) & (rx >= 3.00) & (
-            root_z >= torch.clamp(wall_h + 0.30, min=0.55)) & (
+            root_z >= torch.clamp(wall_h + 0.10, min=0.55)) & (
             root_vz.abs() < 0.4)
     if "plum" in columns:
         m = branch("plum")

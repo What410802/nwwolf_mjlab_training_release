@@ -193,7 +193,7 @@ def main() -> None:
         # This is a training-predicate SCREEN, not official judge acceptance.
         "screen_pass": done_count >= args.attempts and success == args.attempts,
         "acceptance_eligible": False,
-        "predicate": "training_part2_v5_single_step",
+        "predicate": "training_part2_v6_geometry",
         "success_rate": (success / done_count) if done_count else 0.0,
         "physics": args.physics,
         "command_scale": args.command_scale,
