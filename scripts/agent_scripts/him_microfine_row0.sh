@@ -56,7 +56,7 @@ for ck in $CKPTS; do
   for cat in platform slope stairs high_wall trench; do
     out="$LOGDIR/${JOB}_${name}_${cat}.json"
     .venv/bin/python "$GATE" --task blackw-official-him --checkpoint "$ck" \
-      --category "$cat" --row 0 --attempts 10 --num-envs 8 --seed 0 \
+      --category "$cat" --row 0 --attempts 20 --num-envs 8 --seed 0 \
       --jitter-x 0.05 --jitter-y 0.05 --jitter-yaw 0.05 \
       --vx-min 0.25 --vx-max 1.0 --vy 0.15 --wz 0.2 \
       --max-steps 1000 --out "$out" >/dev/null 2>&1
