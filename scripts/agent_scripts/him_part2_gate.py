@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--vx-max", type=float, default=1.0)
     ap.add_argument("--vy", type=float, default=0.30)
     ap.add_argument("--wz", type=float, default=1.0)
+    # 0.6 / 1.0 / 1.3 command-envelope robustness sweep.
+    ap.add_argument("--command-scale", type=float, default=1.0)
     ap.add_argument("--num-envs", type=int, default=8)
     ap.add_argument("--max-steps", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
@@ -76,9 +78,9 @@ def main() -> None:
     gen.sub_terrains = {args.category: gen.sub_terrains[args.category]}
     cfg.scene.terrain.max_init_terrain_level = args.row
     cmd = cfg.commands["twist"]
-    cmd.ranges.lin_vel_x = (args.vx_min, args.vx_max)
-    cmd.ranges.lin_vel_y = (-args.vy, args.vy)
-    cmd.ranges.ang_vel_z = (-args.wz, args.wz)
+    cmd.ranges.lin_vel_x = (args.vx_min * args.command_scale, args.vx_max * args.command_scale)
+    cmd.ranges.lin_vel_y = (-args.vy * args.command_scale, args.vy * args.command_scale)
+    cmd.ranges.ang_vel_z = (-args.wz * args.command_scale, args.wz * args.command_scale)
     cmd.resampling_time_range = (2.0, 4.0)
     if args.physics == "deploy":
         # Evaluation at the deployment contract; training remains 5 ms/4 dec.
@@ -161,6 +163,7 @@ def main() -> None:
         "gate_pass": done_count >= args.attempts and success == args.attempts,
         "success_rate": (success / done_count) if done_count else 0.0,
         "physics": args.physics,
+        "command_scale": args.command_scale,
         "jitter": {"x": args.jitter_x, "y": args.jitter_y, "yaw": args.jitter_yaw},
         "command_ranges": {
             "vx": [args.vx_min, args.vx_max],
