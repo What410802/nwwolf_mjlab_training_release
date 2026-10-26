@@ -720,10 +720,22 @@ def _part2_terrain_state(
             root_z >= top + 0.30) & (root_z <= top + 0.75) & (root_vz.abs() < 0.4)
     if "stairs" in columns:
         m = branch("stairs")
-        down_end = 1.80 + 6 * 0.30 * 2 + 0.80
-        on_ground = ((wz >= -0.06) & (wz <= 0.20)).all(dim=1)
-        success |= m & (wx_min >= down_end + 0.10) & on_ground & (
-            rx >= down_end + 0.10) & (root_z >= 0.30) & (root_z <= 0.80) & (
+        # Match the official judge stairs semantics, not the old full
+        # up+landing+down traversal. The judge succeeds once the robot reaches
+        # goal_x_min=3.3 with enough base height; it does not require descending
+        # the far flight. The old hard-coded down_end=6.20 made stairs_success
+        # unreachable (false negative), while the policy could pass the judge.
+        stairs_cfg = terrain.cfg.terrain_generator.sub_terrains.get("stairs")
+        if stairs_cfg is not None and hasattr(stairs_cfg, "total_height_range"):
+            lo, hi = stairs_cfg.total_height_range
+            total = float(lo) + difficulty * (float(hi) - float(lo))
+            step_h = total / float(stairs_cfg.num_steps)
+        else:
+            step_h = 0.10 + 0.0333 * difficulty
+        on_stairs = (wz >= -0.06).all(dim=1) & (
+            wz <= (step_h + 0.30).unsqueeze(1)).all(dim=1)
+        success |= m & (rx >= 3.30) & on_stairs & (
+            root_z >= step_h + 0.38) & (root_z <= step_h + 1.10) & (
             root_vz.abs() < 0.4)
     if "slope" in columns:
         m = branch("slope")
