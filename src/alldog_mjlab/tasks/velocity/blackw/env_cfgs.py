@@ -72,7 +72,13 @@ def _ccd_iterations() -> int:
     |qvel|>100, bad_sim_state on every reset; ccd=50 -> stable stance).  50 is the
     value used by the 1500-iter HIM run with zero bad_sim_state terminations.
     """
-    return int(os.environ.get("BLACKW_CCD_ITERS", "50"))
+    value = int(os.environ.get("BLACKW_CCD_ITERS", "50"))
+    if value < 1:
+        raise ValueError(
+            "BLACKW_CCD_ITERS must be >= 1: with mujoco_warp, 0 disables the "
+            "GJK/EPA iterations and drops wheel-cylinder/terrain support contacts."
+        )
+    return value
 
 
 def _wheel_leg_scale(leg: str) -> dict[str, float]:
@@ -279,8 +285,6 @@ def _nonfinite_state(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
 
 
 def _low_base_height(env, min_root_z: float = 0.55, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
-    import torch
-
     asset = env.scene[asset_cfg.name]
     return asset.data.root_link_pos_w[:, 2] < min_root_z
 
@@ -353,8 +357,6 @@ def _platform_top_success(
     without climbing (false 70% success).  Require the base to be raised to the
     10 cm platform height as well.
     """
-    import torch
-
     asset = env.scene[asset_cfg.name]
     origins = env.scene.terrain.env_origins
     x = asset.data.root_link_pos_w[:, 0] - origins[:, 0]
