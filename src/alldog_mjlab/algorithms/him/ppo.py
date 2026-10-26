@@ -129,8 +129,15 @@ class HIMPPO(PPO):
 
     def _update_estimator(self, batch: HIMBatch, lr: float) -> tuple[float, float]:
         history = canonical_history(batch.observations[self.interface.history_group])
+        # Keep the estimator optimizer's configured LR independent of the adaptive
+        # PPO LR by default; blackW_him_rl_cfg's estimator_learning_rate was
+        # effectively dead because every update overwrote it with PPO's LR.
+        # An explicit env var allows the official shared-LR behaviour for A/B.
+        estimator_lr = os.environ.get("BLACKW_HIM_ESTIMATOR_LR")
+        effective_lr = float(estimator_lr) if estimator_lr else None
         return self.actor.estimator.update(
-            history, batch.next_estimator_input, batch.next_estimator_velocity, lr=lr
+            history, batch.next_estimator_input, batch.next_estimator_velocity,
+            lr=effective_lr,
         )
 
     def _zero_estimator_grads(self) -> None:

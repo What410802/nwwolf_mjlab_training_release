@@ -450,7 +450,7 @@ def _exact_env_cfg(terrain_cfg, play: bool) -> ManagerBasedRlEnvCfg:
     cfg.sim.njmax = 4096
     # Wheel cylinders vs platform box hit a Mujoco-Warp CCD assert in HIM
     # exploration; these tasks are low-speed, so disable CCD.
-    cfg.sim.ccd_iterations = 0
+    cfg.sim.mujoco.ccd_iterations = 0
     if not play:
         # Start exact tasks on the easy rows; all-hardest rows gave zero goal
         # signal for the vertical 40 cm platform and 45-degree ramp.
@@ -537,13 +537,13 @@ def blackw_official_mixed_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.scene.terrain.terrain_generator.size = (16.0, 8.0)
     cfg.sim.nconmax = 1024
     cfg.sim.njmax = 4096
-    cfg.sim.ccd_iterations = 0
+    cfg.sim.mujoco.ccd_iterations = 0
     if not play:
         cfg.scene.terrain.max_init_terrain_level = int(
             os.environ.get("BLACKW_MAX_ROW", "0")
         )
         cfg.terminations["lane_deviation"] = TerminationTermCfg(
-            func=_lane_deviation, params={"max_abs_y": 0.80}
+            func=_lane_deviation, params={"max_abs_y": 0.70}
         )
         command = cfg.commands["twist"]
         command.ranges.lin_vel_x = (0.25, 1.0)
@@ -627,7 +627,7 @@ def blackw_platform_easy_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 def blackw_platform_ccd_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     """Easy platform stage with CCD enabled (official wheel-box contact)."""
     cfg = blackw_platform_easy_env_cfg(play=play)
-    cfg.sim.ccd_iterations = 50
+    cfg.sim.mujoco.ccd_iterations = 50
     return cfg
 
 
@@ -666,7 +666,7 @@ def blackw_platform_micro_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         if cfg.scene.terrain is not None:
             cfg.scene.terrain.max_init_terrain_level = 0
         cfg.terminations["lane_deviation"].params["max_abs_y"] = 0.60
-        cfg.sim.ccd_iterations = 50
+        cfg.sim.mujoco.ccd_iterations = 50
     return cfg
 
 
@@ -675,11 +675,14 @@ def _part2_terrain_state(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     wheel_radius: float = 0.103,
 ):
-    """Per-env official Part2 success / rule-violation state from wheel poses.
+    """Training-side Part2 approximation from wheel poses (NOT the official judge).
 
-    v5: wheel-bottom support *band* + base height band + ``|vz|`` gate, matching
-    the strict judge; old v4 only checked a lower wheel bound, which allowed
-    jumping over the platform to count as success.
+    v5 training predicate: wheel-bottom support band + base height band +
+    ``|vz|`` gate. It is intentionally cheap and stateless for reward/termination;
+    it does not implement the judge's ``hold_s``, wall crossing/contact, stairs
+    top_seen or trench near/far crossing. Gate output is therefore a
+    ``screen_pass`` only; official judge/export is the acceptance path. Old v4
+    only checked a lower wheel bound and allowed jumping/penetration successes.
     """
     import torch
 
@@ -731,11 +734,15 @@ def _part2_terrain_state(
             total = float(lo) + difficulty * (float(hi) - float(lo))
             step_h = total / float(stairs_cfg.num_steps)
         else:
-            step_h = 0.10 + 0.0333 * difficulty
+            total = 0.60 + 1.20 * difficulty
+            step_h = total / 6.0
+        # On the training terrain the top/landing is at total height, not one
+        # step height: wheels may sit anywhere from step_h to total, and the
+        # base can be near total + standing height. Do not cap at step_h+0.30.
         on_stairs = (wz >= -0.06).all(dim=1) & (
-            wz <= (step_h + 0.30).unsqueeze(1)).all(dim=1)
+            wz <= (total + 0.30).unsqueeze(1)).all(dim=1)
         success |= m & (rx >= 3.30) & on_stairs & (
-            root_z >= step_h + 0.38) & (root_z <= step_h + 1.10) & (
+            root_z >= step_h + 0.38) & (root_z <= total + 0.80) & (
             root_vz.abs() < 0.4)
     if "slope" in columns:
         m = branch("slope")
@@ -746,7 +753,23 @@ def _part2_terrain_state(
             root_z >= rise + 0.30) & (root_z <= rise + 0.75) & (root_vz.abs() < 0.4)
     if "high_wall" in columns:
         m = branch("high_wall")
-        success |= m & (wx_min >= 2.02) & (wz.max(dim=1).values <= 0.08) & (rx >= 2.27)
+        # Wall-relative crossing: the wall center is wall_x=2.5 and half
+        # thickness=0.06, so its front face is 2.44. The old 2.02/2.27 test
+        # fired while the robot was still approaching the wall (rear wheels
+        # >=2.02, base>=2.27), making high_wall screen 20/20 and the sparse
+        # reward hackable. Require all wheels past the wall and root at goal.
+        wall_cfg = terrain.cfg.terrain_generator.sub_terrains.get("high_wall")
+        if wall_cfg is not None and hasattr(wall_cfg, "wall_x"):
+            wall_front = float(wall_cfg.wall_x) - float(wall_cfg.wall_thickness) / 2.0
+            wall_h = float(wall_cfg.wall_height_range[0]) + difficulty * (
+                float(wall_cfg.wall_height_range[1]) - float(wall_cfg.wall_height_range[0])
+            )
+        else:
+            wall_front = 2.44
+            wall_h = 0.10 + 0.30 * difficulty
+        success |= m & (wx_min >= wall_front) & (rx >= 3.00) & (
+            root_z >= torch.clamp(wall_h + 0.30, min=0.55)) & (
+            root_vz.abs() < 0.4)
     if "plum" in columns:
         m = branch("plum")
         in_cubes = (wx >= 3.90) & (wx <= 11.00)
@@ -756,17 +779,33 @@ def _part2_terrain_state(
             rx >= 11.10) & (root_z >= 0.62) & (root_z <= 1.10) & (root_vz.abs() < 0.4)
     if "trench" in columns:
         m = branch("trench")
+        # Exact terrain: entry ramp starts at start_x, near plateau ends at
+        # start_x + ramp_run + 2*near_half_x; gap then far plateau. The old
+        # hardcoded near_x=3.80 was on the far plateau, so violation never
+        # fired in the real slot. Derive both edges from the CFG.
         gap_w = 0.10 + 0.20 * difficulty
-        near_x = 3.80
+        trench_cfg = terrain.cfg.terrain_generator.sub_terrains.get("trench")
+        if trench_cfg is not None and hasattr(trench_cfg, "start_x"):
+            near_x = (
+                float(trench_cfg.start_x)
+                + float(trench_cfg.ramp_run)
+                + 2.0 * float(trench_cfg.near_half_x)
+            )
+            plateau_h = float(trench_cfg.plateau_height)
+        else:
+            near_x = 3.50
+            plateau_h = 0.30
         far_x = near_x + gap_w
-        allowed_drop = min(0.5 * 0.30, float(wheel_radius))
-        floor_z = 0.30 - allowed_drop
+        allowed_drop = min(0.5 * plateau_h, float(wheel_radius))
+        floor_z = plateau_h - allowed_drop
         in_slot = (wx >= near_x - 0.06) & (wx <= (far_x + 0.06).unsqueeze(1))
         violation |= m & (in_slot & (wz < floor_z - 0.01)).any(dim=1)
-        on_plateau = ((wz >= 0.24) & (wz <= 0.50)).all(dim=1)
+        on_plateau = ((wz >= plateau_h - 0.06) & (wz <= plateau_h + 0.20)).all(dim=1)
         success |= m & (wx_min >= far_x + 0.15) & on_plateau & (
-            root_z >= 0.68) & (root_z <= 1.10) & (root_vz.abs() < 0.4)
+            root_z >= plateau_h + 0.38) & (root_z <= plateau_h + 0.80) & (
+            root_vz.abs() < 0.4)
     return success, violation
+
 
 
 def _part2_clear_reward(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
@@ -778,13 +817,13 @@ def _part2_clear_reward(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 
 
 def _part2_failure(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
-    """Termination: attempt became invalid per the strict Part2 judge."""
+    """Training termination: approximation of a Part2 violation (not judge acceptance)."""
     _, violation = _part2_terrain_state(env, asset_cfg)
     return violation
 
 
 def _part2_success(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
-    """Termination: all four wheels reached the target support surface."""
+    """Training termination: approximation of Part2 success (not judge acceptance)."""
     success, _ = _part2_terrain_state(env, asset_cfg)
     return success
 

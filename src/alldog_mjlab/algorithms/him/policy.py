@@ -193,14 +193,23 @@ class HIMPolicy(nn.Module):
         """
         if self.distribution is None:
             return
-        param = getattr(self.distribution, "log_std_param", None)
-        if param is None:
-            return
-        bad = ~torch.isfinite(param)
-        if bad.any():
-            with torch.no_grad():
-                param[bad] = 0.0
-            print(f"[GUARD] HIM policy: sanitized {int(bad.sum())} non-finite log_std values")
+        # RSL-RL supports both std_type="scalar" (std_param) and "log"
+        # (log_std_param).  The historical guard only handled log_std_param, so
+        # with blackW's scalar distribution it was dead code.
+        log_param = getattr(self.distribution, "log_std_param", None)
+        scalar_param = getattr(self.distribution, "std_param", None)
+        if log_param is not None:
+            bad = ~torch.isfinite(log_param)
+            if bad.any():
+                with torch.no_grad():
+                    log_param[bad] = 0.0
+                print(f"[GUARD] HIM policy: sanitized {int(bad.sum())} non-finite log_std values")
+        if scalar_param is not None:
+            bad = ~torch.isfinite(scalar_param) | (scalar_param <= 0)
+            if bad.any():
+                with torch.no_grad():
+                    scalar_param[bad] = 0.1
+                print(f"[GUARD] HIM policy: sanitized {int(bad.sum())} non-finite/non-positive std values")
 
     def forward(
         self,

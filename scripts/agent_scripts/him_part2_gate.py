@@ -127,7 +127,8 @@ def main() -> None:
     assert "part2_success" in term_mgr.active_terms, (
         f"part2_success not active after env build: {term_mgr.active_terms}"
     )
-    vec = RslRlVecEnvWrapper(env, clip_actions=load_rl_cfg(args.task).clip_actions)
+    clip_actions = load_rl_cfg(args.task).clip_actions
+    vec = RslRlVecEnvWrapper(env, clip_actions=clip_actions)
     agent_cfg = load_rl_cfg(args.task)
     runner = load_runner_cls(args.task)(vec, asdict(agent_cfg), device="cuda:0")
     runner.load(args.checkpoint, load_cfg={"actor": True}, strict=True, map_location="cuda:0")
@@ -143,7 +144,15 @@ def main() -> None:
     max_steps = int(args.max_steps) if args.max_steps > 0 else int(cfg.episode_length_s / step_dt)
     with torch.no_grad():
         for _ in range(max_steps):
-            obs, _, dones, _ = vec.step(policy(obs))
+            action = policy(obs)
+            action = torch.nan_to_num(
+                action, nan=0.0,
+                posinf=float(clip_actions) if clip_actions is not None else 100.0,
+                neginf=-float(clip_actions) if clip_actions is not None else -100.0,
+            )
+            if clip_actions is not None:
+                action = torch.clamp(action, -clip_actions, clip_actions)
+            obs, _, dones, _ = vec.step(action)
             done_ids = dones.bool()
             if done_ids.any():
                 succ = term_mgr.get_term("part2_success")
@@ -171,10 +180,16 @@ def main() -> None:
         "attempts_done": done_count,
         "success": success,
         "failure": failure,
-        "out_of_course": out_of_course,
-        # The strict predicate's part2_failure already covers a wheel drop; no
-        # separate wheel-drop bit is exposed by the task, so keep this explicit.
-        "wheel_drop": 0,
+        "out_of_course": out_of_course if "part2_out_of_course" in term_mgr.active_terms else None,
+        # No separate wheel-drop term is exposed by the training task; do not
+        # pretend it was measured. The strict part2_failure remains the proxy.
+        "wheel_drop": None,
+        "metric_availability": {
+            "part2_success": True,
+            "part2_failure": True,
+            "part2_out_of_course": "part2_out_of_course" in term_mgr.active_terms,
+            "wheel_drop": False,
+        },
         # This is a training-predicate SCREEN, not official judge acceptance.
         "screen_pass": done_count >= args.attempts and success == args.attempts,
         "acceptance_eligible": False,

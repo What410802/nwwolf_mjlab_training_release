@@ -54,10 +54,21 @@ def _map_official(policy, path: str) -> None:
             target = "mlp." + name[len("actor."):]
         elif name.startswith("estimator."):
             target = "estimator.encoder." + name[len("estimator."):]
+        elif name.startswith("mlp."):
+            # Native HIM TorchScript export (this project's export_him_policy.py).
+            target = name
+        elif name.startswith("encoder."):
+            target = "estimator.encoder." + name[len("encoder."):]
         else:
             raise ValueError(f"unexpected official parameter: {name}")
         mapped[target] = value
     missing, unexpected = policy.load_state_dict(mapped, strict=False)
+    missing_mlp = [name for name in missing if name.startswith("mlp.")]
+    if missing_mlp:
+        raise RuntimeError(
+            f"warm start incomplete: missing actor MLP keys {missing_mlp}; "
+            "refusing to silently train from a partial/zero actor."
+        )
     print(
         f"[INFO] official warm start: {path} mapped={len(mapped)} "
         f"missing={missing} unexpected={unexpected}"
@@ -84,26 +95,41 @@ class BlackWHimOfficialRunner(BlackHimOnPolicyRunner):
             # The deployment export has no distribution.std_param; keep this
             # visible instead of silently treating the warm start as complete.
             dist = self.alg.actor.distribution
-            std_param = getattr(dist, "log_std_param", None) if dist is not None else None
-            if std_param is not None:
-                print(
-                    "[WARN] official warm start does not restore action std; "
-                    f"current std≈{float(torch.exp(std_param.detach()).mean()):.4f} "
-                    f"(BLACKW_HIM_INIT_STD={os.environ.get('BLACKW_HIM_INIT_STD', '0.1')})"
-                )
+            log_std = getattr(dist, "log_std_param", None) if dist is not None else None
+            scalar_std = getattr(dist, "std_param", None) if dist is not None else None
+            if log_std is not None:
+                std_value = float(torch.exp(log_std.detach()).mean())
+            elif scalar_std is not None:
+                std_value = float(scalar_std.detach().mean())
+            else:
+                std_value = float("nan")
+            print(
+                "[WARN] official warm start does not restore action std; "
+                f"current std≈{std_value:.4f} "
+                f"(BLACKW_HIM_INIT_STD={os.environ.get('BLACKW_HIM_INIT_STD', '0.1')})"
+            )
             self.alg.set_policy_anchor()
         freeze_std = os.environ.get("BLACKW_HIM_FREEZE_STD", "")
         if freeze_std:
             dist = self.alg.actor.distribution
-            param = getattr(dist, "log_std_param", None) if dist is not None else None
-            if param is not None:
+            log_param = getattr(dist, "log_std_param", None) if dist is not None else None
+            scalar_param = getattr(dist, "std_param", None) if dist is not None else None
+            if log_param is not None:
                 if freeze_std == "precheck":
                     with torch.no_grad():
-                        param.fill_(-10.0)
-                    print("[INFO] HIM std frozen to precheck value (std≈0)")
+                        log_param.fill_(-10.0)
+                    print("[INFO] HIM log_std frozen to precheck value (std≈0)")
                 else:
-                    param.requires_grad_(False)
-                    print("[INFO] HIM std frozen at warm-start/init value")
+                    log_param.requires_grad_(False)
+                    print("[INFO] HIM log_std frozen at warm-start/init value")
+            elif scalar_param is not None:
+                if freeze_std == "precheck":
+                    with torch.no_grad():
+                        scalar_param.fill_(1e-5)
+                    print("[INFO] HIM scalar std frozen to precheck value (std≈1e-5)")
+                else:
+                    scalar_param.requires_grad_(False)
+                    print("[INFO] HIM scalar std frozen at warm-start/init value")
 
     def save(self, path, infos=None):
         try:
