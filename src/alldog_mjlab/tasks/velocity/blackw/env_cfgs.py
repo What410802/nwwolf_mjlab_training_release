@@ -63,6 +63,18 @@ BLACKW_ACTOR_OBS_SCALE = {
 }
 
 
+def _ccd_iterations() -> int:
+    """CCD iterations for the exact Part2 terrain patches.
+
+    Do not set this to 0 to "save time": with CCD disabled mujoco_warp drops the
+    wheel-cylinder/terrain-box support contact, so rollouts free-fall through the
+    patch floor from spawn (30-env A/B: ccd=0 -> every env below z=0 within 0.4 s,
+    |qvel|>100, bad_sim_state on every reset; ccd=50 -> stable stance).  50 is the
+    value used by the 1500-iter HIM run with zero bad_sim_state terminations.
+    """
+    return int(os.environ.get("BLACKW_CCD_ITERS", "50"))
+
+
 def _wheel_leg_scale(leg: str) -> dict[str, float]:
     return {
         f"{leg}_hip_joint": 0.25,
@@ -361,6 +373,27 @@ def _override_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
         cfg.rewards["base_height"].params["target_height"] = 0.69
 
 
+def _override_terminations(cfg: ManagerBasedRlEnvCfg) -> None:
+    """Make ``bad_sim_state`` wheel-aware for the wheel-legged robot.
+
+    blackW wheel actions are velocity targets with scale 10, so a 150 rad/s wheel
+    is a normal command, not a physics blow-up; the Black leg-only 100 rad/s limit
+    would terminate every warm-started or high-speed wheeled episode (measured:
+    all 304 resets of the official warm start at ccd=50 came from wheel qvel).
+    """
+    term = cfg.terminations.get("bad_sim_state")
+    if term is None:
+        return
+    cfg.terminations["bad_sim_state"] = replace(
+        term,
+        params={
+            **term.params,
+            "wheel_joint_names": BLACKW_WHEEL_JOINTS,
+            "max_wheel_vel": float(os.environ.get("BLACKW_MAX_WHEEL_VEL", "400")),
+        },
+    )
+
+
 def _apply_blackw_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
     _override_robot(cfg)
     _override_sensors(cfg)
@@ -368,6 +401,7 @@ def _apply_blackw_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
     _override_observations(cfg)
     _override_events(cfg)
     _override_rewards(cfg)
+    _override_terminations(cfg)
     return cfg
 
 
@@ -448,9 +482,9 @@ def _exact_env_cfg(terrain_cfg, play: bool) -> ManagerBasedRlEnvCfg:
     # nconmax=172 on the 45-degree ramp. Give the exact tasks headroom.
     cfg.sim.nconmax = 1024
     cfg.sim.njmax = 4096
-    # Wheel cylinders vs platform box hit a Mujoco-Warp CCD assert in HIM
-    # exploration; these tasks are low-speed, so disable CCD.
-    cfg.sim.mujoco.ccd_iterations = 0
+    # CCD is a correctness requirement here, not a speed knob (see
+    # ``_ccd_iterations``): disabling it removes the wheel/ground support contact.
+    cfg.sim.mujoco.ccd_iterations = _ccd_iterations()
     if not play:
         # Start exact tasks on the easy rows; all-hardest rows gave zero goal
         # signal for the vertical 40 cm platform and 45-degree ramp.
@@ -537,7 +571,7 @@ def blackw_official_mixed_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.scene.terrain.terrain_generator.size = (16.0, 8.0)
     cfg.sim.nconmax = 1024
     cfg.sim.njmax = 4096
-    cfg.sim.mujoco.ccd_iterations = 0
+    cfg.sim.mujoco.ccd_iterations = _ccd_iterations()
     if not play:
         cfg.scene.terrain.max_init_terrain_level = int(
             os.environ.get("BLACKW_MAX_ROW", "0")

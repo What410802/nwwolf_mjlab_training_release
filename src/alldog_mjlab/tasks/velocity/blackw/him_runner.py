@@ -145,7 +145,11 @@ class BlackWHimOfficialRunner(BlackHimOnPolicyRunner):
                 f"nonfinite_actions={self.env.nonfinite_actions} "
                 f"max_abs_action={self.env.max_abs_action:.3f}"
             )
+            # Reset both counters: an un-reset max_abs_action hides whether the
+            # policy is still growing between saves (job24 reported 45 for 90
+            # iterations because the running max was never cleared).
             self.env.nonfinite_actions = 0
+            self.env.max_abs_action = 0.0
         except Exception as exc:  # noqa: BLE001 - monitoring must never stop training
             print(f"[HIM guard] monitor unavailable: {type(exc).__name__}: {exc}")
         return super().save(path, infos)

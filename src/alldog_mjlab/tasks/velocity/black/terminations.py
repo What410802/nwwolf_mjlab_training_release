@@ -77,6 +77,8 @@ def bad_sim_state(
     max_joint_vel: float,
     max_root_ang_vel: float,
     max_root_lin_vel: float,
+    wheel_joint_names: tuple[str, ...] = (),
+    max_wheel_vel: float = 0.0,
 ) -> torch.Tensor:
     """Terminate envs whose physics state is non-finite or numerically extreme.
 
@@ -86,7 +88,8 @@ def bad_sim_state(
     before the next observation stops the chain while leaving normal gait
     (``|qvel|`` well below the thresholds) untouched.
     """
-    data = env.scene[asset_cfg.name].data
+    asset = env.scene[asset_cfg.name]
+    data = asset.data
     joint_pos = data.joint_pos
     joint_vel = data.joint_vel
     root_pos = data.root_link_pos_w
@@ -100,7 +103,24 @@ def bad_sim_state(
     bad |= ~torch.isfinite(root_pos).all(dim=1)
     bad |= ~torch.isfinite(root_ang).all(dim=1)
     bad |= ~torch.isfinite(root_lin).all(dim=1)
-    bad |= joint_vel.abs().amax(dim=1) > max_joint_vel
+    # Wheel joints are velocity targets (blackW wheel scale 10), so 100+ rad/s
+    # is a legitimate command rather than a numerical blow-up.  Split the limit
+    # when wheel names are given; ``max_wheel_vel <= 0`` keeps the old semantics.
+    wheel_ids = (
+        [i for i, name in enumerate(asset.joint_names) if name in wheel_joint_names]
+        if wheel_joint_names
+        else []
+    )
+    if wheel_ids and max_wheel_vel > 0.0:
+        wheel_mask = torch.zeros(
+            joint_vel.shape[1], dtype=torch.bool, device=joint_vel.device
+        )
+        wheel_mask[wheel_ids] = True
+        if (~wheel_mask).any():
+            bad |= joint_vel[:, ~wheel_mask].abs().amax(dim=1) > max_joint_vel
+        bad |= joint_vel[:, wheel_mask].abs().amax(dim=1) > max_wheel_vel
+    else:
+        bad |= joint_vel.abs().amax(dim=1) > max_joint_vel
     bad |= root_ang.abs().amax(dim=1) > max_root_ang_vel
     bad |= root_lin.abs().amax(dim=1) > max_root_lin_vel
     return bad
