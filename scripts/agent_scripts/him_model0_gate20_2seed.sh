@@ -52,7 +52,7 @@ import json, sys
 d=json.load(open(sys.argv[1]))
 print(f"gate s={sys.argv[2]} p={sys.argv[3]} c={sys.argv[4]} "
       f"done={d['attempts_done']} success={d['success']} fail={d['failure']} "
-      f"out={d['out_of_course']} pass={d['gate_pass']} rate={d['success_rate']:.3f}")
+      f"out={d['out_of_course']} screen={d['screen_pass']} rate={d['success_rate']:.3f}")
 PY
     done
   done

@@ -13,7 +13,6 @@ import torch
 
 from mjlab.actuator.actuator import TransmissionType
 from mjlab.envs.mdp.actions.actions import BaseAction, BaseActionCfg
-from mjlab.managers.action_manager import ActionTerm
 
 
 @dataclass(kw_only=True)

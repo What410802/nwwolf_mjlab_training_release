@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import mujoco
 import numpy as np
 
-from mjlab.terrains.terrain_generator import FlatPatchSamplingCfg, TerrainGeometry, TerrainOutput
+from mjlab.terrains.terrain_generator import TerrainGeometry, TerrainOutput
 from mjlab.terrains import SubTerrainCfg
 
 _FLOOR_RGBA = (0.45, 0.45, 0.45, 1.0)

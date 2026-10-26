@@ -83,9 +83,24 @@ def main() -> None:
     cmd.ranges.ang_vel_z = (-args.wz * args.command_scale, args.wz * args.command_scale)
     cmd.resampling_time_range = (2.0, 4.0)
     if args.physics == "deploy":
-        # Evaluation at the deployment contract; training remains 5 ms/4 dec.
-        cfg.sim.mujoco.timestep = 0.002
+        # Match the official Part2 scene <option> block as closely as mujoco_warp
+        # allows: euler / elliptic cone / impratio=100 / 100 solver iters / CCD.
+        # PGS is not implemented by mujoco_warp; newton is kept as an approximation.
+        sim = cfg.sim.mujoco
+        sim.integrator = "euler"
+        sim.cone = "elliptic"
+        sim.jacobian = "sparse"
+        sim.solver = "newton"
+        sim.iterations = 100
+        sim.ls_iterations = 50
+        sim.ls_tolerance = 0.01
+        sim.impratio = 100.0
+        sim.ccd_iterations = 35
+        sim.timestep = 0.002
         cfg.decimation = 10
+        robot = cfg.scene.entities.get("robot")
+        if robot is not None and getattr(robot, "init_state", None) is not None:
+            robot.init_state.pos = (0.0, 0.0, 0.52)
     # Add explicit spawn/yaw jitter; the training reset only randomizes velocity
     # and joint state, so a gate from one fixed spawn overstates robustness.
     reset_base = cfg.events.get("reset_base")
@@ -160,7 +175,10 @@ def main() -> None:
         # The strict predicate's part2_failure already covers a wheel drop; no
         # separate wheel-drop bit is exposed by the task, so keep this explicit.
         "wheel_drop": 0,
-        "gate_pass": done_count >= args.attempts and success == args.attempts,
+        # This is a training-predicate SCREEN, not official judge acceptance.
+        "screen_pass": done_count >= args.attempts and success == args.attempts,
+        "acceptance_eligible": False,
+        "predicate": "training_part2_v5_single_step",
         "success_rate": (success / done_count) if done_count else 0.0,
         "physics": args.physics,
         "command_scale": args.command_scale,

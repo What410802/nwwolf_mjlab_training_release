@@ -68,7 +68,7 @@ for ck in $CKPTS; do
 import json, sys
 d=json.load(open(sys.argv[1]))
 print(f"gate {sys.argv[2]} {sys.argv[3]} done={d['attempts_done']} success={d['success']} "
-      f"fail={d['failure']} out={d['out_of_course']} pass={d['gate_pass']}")
+      f"fail={d['failure']} out={d['out_of_course']} screen={d['screen_pass']}")
 PY
   done
 done
