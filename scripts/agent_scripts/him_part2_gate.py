@@ -39,6 +39,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--num-envs", type=int, default=8)
     ap.add_argument("--max-steps", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
+    # Spawn/heading jitter around the training reset pose.
+    ap.add_argument("--jitter-x", type=float, default=0.05)
+    ap.add_argument("--jitter-y", type=float, default=0.05)
+    ap.add_argument("--jitter-yaw", type=float, default=0.05)
+    ap.add_argument("--physics", choices=("train", "deploy"), default="train")
     ap.add_argument("--check-config-only", action="store_true")
     ap.add_argument("--out", default=None)
     return ap.parse_args()
@@ -75,6 +80,19 @@ def main() -> None:
     cmd.ranges.lin_vel_y = (-args.vy, args.vy)
     cmd.ranges.ang_vel_z = (-args.wz, args.wz)
     cmd.resampling_time_range = (2.0, 4.0)
+    if args.physics == "deploy":
+        # Evaluation at the deployment contract; training remains 5 ms/4 dec.
+        cfg.sim.mujoco.timestep = 0.002
+        cfg.decimation = 10
+    # Add explicit spawn/yaw jitter; the training reset only randomizes velocity
+    # and joint state, so a gate from one fixed spawn overstates robustness.
+    reset_base = cfg.events.get("reset_base")
+    if reset_base is not None:
+        reset_base.params["pose_range"] = {
+            "x": (-args.jitter_x, args.jitter_x),
+            "y": (-args.jitter_y, args.jitter_y),
+            "yaw": (-args.jitter_yaw, args.jitter_yaw),
+        }
 
     if args.check_config_only:
         step_dt = cfg.sim.mujoco.timestep * cfg.decimation
@@ -136,8 +154,14 @@ def main() -> None:
         "attempts_done": done_count,
         "success": success,
         "failure": failure,
-        "out_of_course": wheel_drop,
-        "wheel_drop": wheel_drop,
+        "out_of_course": out_of_course,
+        # The strict predicate's part2_failure already covers a wheel drop; no
+        # separate wheel-drop bit is exposed by the task, so keep this explicit.
+        "wheel_drop": 0,
+        "gate_pass": done_count >= args.attempts and success == args.attempts,
+        "success_rate": (success / done_count) if done_count else 0.0,
+        "physics": args.physics,
+        "jitter": {"x": args.jitter_x, "y": args.jitter_y, "yaw": args.jitter_yaw},
         "command_ranges": {
             "vx": [args.vx_min, args.vx_max],
             "vy": [-args.vy, args.vy],
