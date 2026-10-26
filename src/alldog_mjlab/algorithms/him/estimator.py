@@ -145,11 +145,27 @@ class HIMEstimator(nn.Module):
         estimation_loss, swap_loss = self.losses(history, next_input, next_velocity)
         loss = estimation_loss + swap_loss
 
+        if not torch.isfinite(loss).all():
+            self.optimizer.zero_grad()
+            print(
+                "[GUARD] HIM estimator: non-finite loss "
+                f"estimation={float(estimation_loss.detach()):.3g} "
+                f"swap={float(swap_loss.detach()):.3g}; update skipped"
+            )
+            return 0.0, 0.0
+
         self.optimizer.zero_grad()
         loss.backward()
+        grads_finite = all(
+            p.grad is None or torch.isfinite(p.grad).all() for p in self.parameters()
+        )
+        if not grads_finite:
+            self.optimizer.zero_grad()
+            print("[GUARD] HIM estimator: non-finite grad; update skipped")
+            return 0.0, 0.0
         nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
         self.optimizer.step()
-        return estimation_loss.item(), swap_loss.item()
+        return float(estimation_loss.detach()), float(swap_loss.detach())
 
 
 @torch.no_grad()

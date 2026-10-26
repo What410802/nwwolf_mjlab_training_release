@@ -137,6 +137,9 @@ def configure_him_observations(cfg: ManagerBasedRlEnvCfg) -> None:
         concatenate_terms=True,
         enable_corruption=False,
     )
+    # This group is a training target, not an actor input; never let a nonfinite
+    # terminal/base velocity silently enter the estimator objective.
+    cfg.observations[BLACK_HIM_VELOCITY_GROUP].nan_policy = "sanitize"
 
 
 def configure_him_terminal_targets(cfg: ManagerBasedRlEnvCfg) -> None:
@@ -202,6 +205,9 @@ def compute_observation_frame(
             obs = obs.clip(min=term_cfg.clip[0], max=term_cfg.clip[1])
         if term_cfg.scale is not None:
             obs = obs * term_cfg.scale
+        # HIM terminal targets are computed outside ObservationManager and therefore
+        # bypass its nan_policy; sanitize them explicitly before they enter losses.
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=100.0, neginf=-100.0)
         frames.append(obs)
     return torch.cat(frames, dim=-1)
 

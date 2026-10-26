@@ -20,6 +20,7 @@ advantage normalization / normalizer / logging 语义。
 
 from __future__ import annotations
 
+import os
 from itertools import chain
 
 import torch
@@ -65,6 +66,10 @@ class HIMPPO(PPO):
         self.spec = spec
         self.interface = interface
         self.transition = HIMTransition()
+        self._policy_anchor: list[torch.Tensor] | None = None
+        self._anchor_alpha = min(1.0, max(0.0, float(os.environ.get("BLACKW_HIM_ANCHOR_ALPHA", "0.0"))))
+        if self._anchor_alpha > 0:
+            print(f"[INFO] HIM teacher anchor enabled: alpha={self._anchor_alpha:g}")
 
         # Optimizer 分账：PPO 只拥有 actor policy 参数（不含 estimator）与 critic 参数。
         # estimator 参数由 HIMEstimator.optimizer 独占；同一个 parameter 不会同时进入
@@ -132,6 +137,32 @@ class HIMPPO(PPO):
         """清空 estimator grad，保证 PPO 反向传播路径与 estimator 参数完全分离。"""
         for param in self.actor.estimator.parameters():
             param.grad = None
+
+    def set_policy_anchor(self) -> None:
+        """Snapshot the current (warm-start teacher) policy for optional anchoring."""
+        self._policy_anchor = [p.detach().clone() for p in self.actor.policy_parameters()]
+        print(f"[INFO] HIM teacher anchor snapshot: {len(self._policy_anchor)} tensors")
+
+    def _apply_policy_anchor(self) -> None:
+        """After an optimizer step: p <- (1-alpha)*p + alpha*teacher_snapshot."""
+        if self._policy_anchor is None or self._anchor_alpha <= 0.0:
+            return
+        alpha = self._anchor_alpha
+        with torch.no_grad():
+            for param, ref in zip(self.actor.policy_parameters(), self._policy_anchor):
+                if param.shape == ref.shape:
+                    param.mul_(1.0 - alpha).add_(ref, alpha=alpha)
+
+    @staticmethod
+    def _all_finite(*tensors: torch.Tensor) -> bool:
+        return all(torch.isfinite(t).all().item() for t in tensors)
+
+    def _skip_nonfinite_update(self, where: str, *tensors: torch.Tensor) -> None:
+        values = ", ".join(
+            f"{t.shape}:{bool(torch.isfinite(t).all().item())}" for t in tensors
+        )
+        self._nonfinite_updates = getattr(self, "_nonfinite_updates", 0) + 1
+        print(f"[GUARD] HIM PPO: non-finite {where} ({values}); update skipped")
 
     def update(self) -> dict[str, float]:
         """PPO update + 每个 mini-batch 一次 official estimator update。"""
@@ -203,14 +234,36 @@ class HIMPPO(PPO):
                 - self.entropy_coef * entropy.mean()
             )
 
+            if not self._all_finite(
+                actions_log_prob, values, distribution_params[0], distribution_params[1],
+                entropy, ratio, surrogate_loss, value_loss, loss,
+            ):
+                self._skip_nonfinite_update(
+                    "PPO loss", actions_log_prob, values, entropy, ratio,
+                    surrogate_loss, value_loss, loss,
+                )
+                self.optimizer.zero_grad()
+                self._zero_estimator_grads()
+                continue
+
             # 5) PPO gradient step。estimator 参数既不在 PPO optimizer 里，也不接收
             #    PPO 反向传播的梯度（HIMPolicy.get_latent 在 no_grad 下跑 source encoder）。
             self.optimizer.zero_grad()
             self._zero_estimator_grads()
             loss.backward()
+            grads_finite = all(
+                p.grad is None or torch.isfinite(p.grad).all()
+                for p in chain(self.actor.policy_parameters(), self.critic.parameters())
+            )
+            if not grads_finite:
+                self._skip_nonfinite_update("PPO grad", loss)
+                self.optimizer.zero_grad()
+                self._zero_estimator_grads()
+                continue
             nn.utils.clip_grad_norm_(self.actor.policy_parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            self._apply_policy_anchor()
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()

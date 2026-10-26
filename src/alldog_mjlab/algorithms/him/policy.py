@@ -184,6 +184,24 @@ class HIMPolicy(nn.Module):
             velocity, latent = self.estimator.encode(canonical_history(history))
         return torch.cat((current_frame, velocity, latent), dim=-1)
 
+    def _sanitize_log_std(self) -> None:
+        """Last-resort guard for a non-finite Gaussian log-std before sampling.
+
+        The PPO/estimator update guards should prevent this, but torch.normal
+        asserts on a negative/NaN std; clamping log_std keeps a transient bad
+        update from killing the process.
+        """
+        if self.distribution is None:
+            return
+        param = getattr(self.distribution, "log_std_param", None)
+        if param is None:
+            return
+        bad = ~torch.isfinite(param)
+        if bad.any():
+            with torch.no_grad():
+                param[bad] = 0.0
+            print(f"[GUARD] HIM policy: sanitized {int(bad.sum())} non-finite log_std values")
+
     def forward(
         self,
         obs: TensorDict,
@@ -191,6 +209,7 @@ class HIMPolicy(nn.Module):
         hidden_state: HiddenState = None,
         stochastic_output: bool = False,
     ) -> torch.Tensor:
+        self._sanitize_log_std()
         mlp_output = self.mlp(self.get_latent(obs, masks, hidden_state))
         if self.distribution is not None:
             if stochastic_output:
