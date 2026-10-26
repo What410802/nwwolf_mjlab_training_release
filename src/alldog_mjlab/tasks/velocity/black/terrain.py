@@ -38,6 +38,7 @@ from mjlab.terrains import (
     BoxPyramidStairsTerrainCfg,
     HfDiscreteObstaclesTerrainCfg,
     HfPyramidSlopedTerrainCfg,
+    HfRandomUniformTerrainCfg,
     SubTerrainCfg,
     TerrainGeneratorCfg,
 )
@@ -314,6 +315,109 @@ def black_rough_terrain_generator_cfg() -> TerrainGeneratorCfg:
                 step_height_range=(
                     terrain_params.stair_step_height_base,
                     terrain_params.stair_step_height_base + terrain_params.stair_step_height_gain,
+                ),
+                step_width=terrain_params.stair_step_width,
+                platform_width=terrain_params.platform_width,
+            ),
+        },
+    )
+
+
+def black_gravel_flat_terrain_generator_cfg() -> TerrainGeneratorCfg:
+    """Flat + gravel proxy terrain for the S1b "flat including gravel" gate.
+
+    This is intentionally *not* the legacy rough generator: no stairs, no
+    discrete obstacles, no large slopes.  It keeps mostly flat ground and adds
+    small random heightfields as a cheap rigid proxy for settled gravel.  The
+    free-joint gravel pit remains an evaluation/fidelity scene (see
+    docs/terrain/gravel-feasibility.md).
+    """
+    terrain_params = BLACK_CONFIG.terrain
+    return TerrainGeneratorCfg(
+        curriculum=True,
+        size=terrain_params.size,
+        border_width=terrain_params.border_width,
+        num_rows=6,
+        difficulty_range=(0.0, 0.5),
+        add_lights=True,
+        sub_terrains={
+            "flat": BoxFlatTerrainCfg(proportion=0.50),
+            "gravel_fine": BlackRoughSlopeTerrainCfg(
+                proportion=0.30,
+                slope_range=(0.0, 0.0),
+                noise_base=0.0,
+                noise_gain=0.025,
+                noise_step=0.005,
+                noise_downsample=0.15,
+                base_thickness_ratio=1.0,
+                platform_width=terrain_params.platform_width,
+                horizontal_scale=terrain_params.horizontal_scale,
+                vertical_scale=terrain_params.vertical_scale,
+            ),
+            "gravel_coarse": HfRandomUniformTerrainCfg(
+                proportion=0.20,
+                noise_range=(-0.02, 0.02),
+                noise_step=0.005,
+                downsampled_scale=0.2,
+                horizontal_scale=terrain_params.horizontal_scale,
+                vertical_scale=terrain_params.vertical_scale,
+                base_thickness_ratio=1.0,
+                scale_with_difficulty=True,
+            ),
+        },
+    )
+
+
+def black_basic_obstacle_terrain_generator_cfg() -> TerrainGeneratorCfg:
+    """P1 basic-obstacle terrain: flat + smooth slopes + stairs (no rough/discrete).
+
+    Keeps the native Black terrain primitives and the flat actor contract.  The
+    difficulty range is deliberately easier than black-rough: rows span
+    d=0.0..0.6, so max slope ~23 deg and max step height ~0.158 m.  P1 targets
+    low-to-mid slope/stairs before adding rough/discrete obstacles.
+    """
+    terrain_params = BLACK_CONFIG.terrain
+    return TerrainGeneratorCfg(
+        curriculum=True,
+        size=terrain_params.size,
+        border_width=terrain_params.border_width,
+        num_rows=6,
+        difficulty_range=(0.0, 0.6),
+        add_lights=True,
+        sub_terrains={
+            "flat": BoxFlatTerrainCfg(proportion=0.20),
+            "smooth_slope_up": HfPyramidSlopedTerrainCfg(
+                proportion=0.20,
+                slope_range=terrain_params.slope_range,
+                platform_width=terrain_params.platform_width,
+                horizontal_scale=terrain_params.horizontal_scale,
+                vertical_scale=terrain_params.vertical_scale,
+                inverted=False,
+            ),
+            "smooth_slope_down": HfPyramidSlopedTerrainCfg(
+                proportion=0.20,
+                slope_range=terrain_params.slope_range,
+                platform_width=terrain_params.platform_width,
+                horizontal_scale=terrain_params.horizontal_scale,
+                vertical_scale=terrain_params.vertical_scale,
+                inverted=True,
+            ),
+            "stairs_up": BoxPyramidStairsTerrainCfg(
+                proportion=0.20,
+                step_height_range=(
+                    terrain_params.stair_step_height_base,
+                    terrain_params.stair_step_height_base
+                    + terrain_params.stair_step_height_gain * 0.6,
+                ),
+                step_width=terrain_params.stair_step_width,
+                platform_width=terrain_params.platform_width,
+            ),
+            "stairs_down": BoxInvertedPyramidStairsTerrainCfg(
+                proportion=0.20,
+                step_height_range=(
+                    terrain_params.stair_step_height_base,
+                    terrain_params.stair_step_height_base
+                    + terrain_params.stair_step_height_gain * 0.6,
                 ),
                 step_width=terrain_params.stair_step_width,
                 platform_width=terrain_params.platform_width,

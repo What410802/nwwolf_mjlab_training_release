@@ -28,6 +28,10 @@ class ControlParams:
     physics_dt: float = 0.005
     decimation: int = 4
     action_scale: float = 0.25
+    # Deployment clips the raw network output to +/-100 (rl_sar config
+    # clip_actions_*).  Applying the same bound in training removes a
+    # train/deploy mismatch and caps the last-action feedback term; <=0 disables.
+    action_clip: float = 100.0
 
     @property
     def policy_dt(self) -> float:
@@ -44,6 +48,44 @@ class ObservationParams:
     joint_vel_scale: float = 0.05
     last_action_scale: float = 1.0
     actor_corruption_enabled: bool = True
+    # Deployment clips the concatenated observation to +/-clip_obs (100).
+    # Per-term clipping here is equivalent after scaling and bounds the
+    # last-action feedback loop in rare falling states; <=0 disables.
+    actor_obs_clip: float = 100.0
+
+
+# =============================================================================
+# Depth camera (C2 vision mainline)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class DepthCameraParams:
+    """Simulated front depth camera (mount: robot/d435_link).
+
+    This is a *simulated real sensor*: the rules allow a camera with realistic
+    noise/latency/extrinsics, and the policy must not see the privileged
+    heightmap/foot sensors.  The camera renders through mujoco_warp's
+    RenderContext (GPU), so it needs no EGL context.
+
+    64x48 / 70 deg / 0.1-3.0 m is the first cost-smoke point; DR (noise, frame
+    drops, extrinsic jitter) is a follow-up item, not implemented yet.
+    """
+
+    # Render resolution. Lowered via env vars only for cost A/B on one machine.
+    width: int = 64
+    height: int = 48
+    fovy: float = 70.0
+    # Mount pose: RealSense D435 body at trunk front, lens looking forward and
+    # 15 deg down.  Quaternion is body<-camera in (w, x, y, z).
+    parent_body: str = "d435_link"
+    position: tuple[float, float, float] = (0.01, 0.0, 0.0)
+    quaternion: tuple[float, float, float, float] = (0.5610, 0.4304, -0.4304, -0.5610)
+    # Depth range and observation normalization.
+    min_depth: float = 0.10
+    cutoff_distance: float = 3.0
+    # Uniform observation noise on the normalized depth image (training only).
+    obs_noise: float = 0.02
 
 
 # =============================================================================
@@ -236,6 +278,13 @@ class TerminationParams:
     stuck_command_threshold: float = 0.2
     stuck_grace: float = 1.0
 
+    # 数值安全终止（不是能力判据）：物理状态进入非有限值或极端速度时终止该 env，
+    # 避免 "怪动作 -> 观测反馈 -> 更大动作 -> NaN -> CUDA 710" 链条传下去。
+    # 阈值远高于正常步态（正常 |qvel| < ~40、|root ang vel| < ~5）。
+    max_joint_vel: float = 100.0
+    max_root_ang_vel: float = 40.0
+    max_root_lin_vel: float = 20.0
+
 
 # =============================================================================
 # Reward
@@ -250,6 +299,7 @@ class RewardScales:
     ang_vel_xy: float = -0.05
     orientation: float = -0.2
     base_height: float = -1.0
+    foot_clearance: float = -0.01
     dof_acc: float = -2.5e-7
     joint_power: float = -2e-5
     action_rate: float = -0.01
@@ -266,6 +316,7 @@ class RewardParams:
 
     tracking_sigma: float = 0.25
     base_height_target: float = 0.43
+    clearance_height_target: float = 0.09
     scales: RewardScales = field(default_factory=RewardScales)
 
 
@@ -312,7 +363,12 @@ class DomainRandomizationParams:
     encoder_bias: tuple[float, float] = (-0.015, 0.015)
 
     # Disturbance（间隔 [s] 与 root xy 速度增量 [m/s]）
-    push_interval: tuple[float, float] = (16.0, 16.0)
+    # 2026-10-24: was a fixed 16 s, i.e. exactly one push at the same phase of every
+    # 20 s episode -> the policy could learn the schedule and pushes were missing from
+    # most of the experience.  Sample the interval per env from this range instead
+    # (event manager samples lower..upper at reset and after every push; with 20 s
+    # episodes some envs now get zero pushes and others one or two).
+    push_interval: tuple[float, float] = (6.0, 20.0)
     push_velocity: dict[str, tuple[float, float]] = field(
         default_factory=lambda: {
             "x": (-1.0, 1.0),
@@ -510,6 +566,22 @@ class RunnerParams:
     rough: StageRunnerParams = field(
         default_factory=lambda: StageRunnerParams(run_name="rough", load_run=r".*_rough$")
     )
+    gravel_flat: StageRunnerParams = field(
+        default_factory=lambda: StageRunnerParams(
+            run_name="gravel_flat", load_run=r".*_gravel_flat$"
+        )
+    )
+    gravel_free: StageRunnerParams = field(
+        default_factory=lambda: StageRunnerParams(
+            run_name="gravel_free", load_run=r".*_gravel_free$"
+        )
+    )
+    # C2 vision mainline: same basic-obstacle terrain, camera in the actor.
+    depth: StageRunnerParams = field(
+        default_factory=lambda: StageRunnerParams(
+            run_name="basic_obstacle_depth", load_run=r".*_basic_obstacle_depth$"
+        )
+    )
     # HIM stage 使用独立 run 名，避免与普通 PPO run 混用（Unit 3 未注册 task，
     # 也不再做 PPO→HIM warm start；命名只用于将来的正式 HIM run）。
     flat_him: StageRunnerParams = field(
@@ -556,6 +628,7 @@ class BlackConfig:
     reward: RewardParams = field(default_factory=RewardParams)
     domain_rand: DomainRandomizationParams = field(default_factory=DomainRandomizationParams)
     terrain: TerrainParams = field(default_factory=TerrainParams)
+    depth: DepthCameraParams = field(default_factory=DepthCameraParams)
     simulation: SimulationParams = field(default_factory=SimulationParams)
     policy: PolicyParams = field(default_factory=PolicyParams)
     him: HimParams = field(default_factory=HimParams)

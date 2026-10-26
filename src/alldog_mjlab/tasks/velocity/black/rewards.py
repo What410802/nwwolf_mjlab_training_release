@@ -24,6 +24,7 @@ from mjlab.envs import mdp as envs_mdp
 from mjlab.managers import ManagerTermBase
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.lab_api.math import quat_apply_inverse
 
 if TYPE_CHECKING:
     from mjlab.entity import Entity
@@ -175,6 +176,36 @@ class base_height_l2_terrain(ManagerTermBase):
         raw_scan = envs_mdp.height_scan(env, sensor_name=sensor_name)
         base_height = raw_scan[:, self._indices].mean(dim=1)
         return torch.square(base_height - target_height)
+
+
+def foot_clearance(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize swing feet that stay below ``target_height``.
+
+    Mirrors HIMLoco's ``_reward_foot_clearance``: height error in the body frame is
+    multiplied by the foot's horizontal speed, so a planted foot is not penalized
+    while a moving foot is encouraged to clear the ground.  The footprint/site
+    order is explicit via ``asset_cfg.site_ids``.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    site_ids = asset_cfg.site_ids
+    root_pos = asset.data.root_link_pos_w[:, None, :]
+    root_quat = asset.data.root_link_quat_w[:, None, :]
+    root_vel = asset.data.root_link_lin_vel_w[:, None, :]
+    foot_pos = asset.data.site_pos_w[:, site_ids]
+    foot_vel = asset.data.site_lin_vel_w[:, site_ids]
+    rel_pos = foot_pos - root_pos
+    rel_vel = foot_vel - root_vel
+    num_feet = rel_pos.shape[1]
+    quat = root_quat.expand(-1, num_feet, -1)
+    body_pos = quat_apply_inverse(quat, rel_pos)
+    body_vel = quat_apply_inverse(quat, rel_vel)
+    height_error = torch.square(body_pos[..., 2] - target_height)
+    lateral_speed = torch.sqrt(torch.sum(torch.square(body_vel[..., :2]), dim=-1))
+    return torch.sum(height_error * lateral_speed, dim=1)
 
 
 def joint_power_l1(

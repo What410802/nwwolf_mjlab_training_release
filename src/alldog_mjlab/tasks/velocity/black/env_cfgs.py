@@ -40,6 +40,24 @@ from alldog_mjlab.robots.black.black_constants import (
     BLACK_JOINT_NAMES,
 )
 from alldog_mjlab.tasks.velocity.black.black_config import BLACK_CONFIG
+from alldog_mjlab.tasks.velocity.black.competition_terrain import (
+    black_competition_terrain_generator_cfg,
+)
+from alldog_mjlab.tasks.velocity.black.competition_rewards import (
+    competition_goal_progress,
+    competition_goal_reached,
+    competition_goal_reward,
+)
+from alldog_mjlab.tasks.velocity.black.terrain import (
+    black_basic_obstacle_terrain_generator_cfg,
+    black_gravel_flat_terrain_generator_cfg,
+    black_rough_terrain_generator_cfg,
+)
+from alldog_mjlab.tasks.velocity.black.free_gravel import add_free_gravel_bed
+from alldog_mjlab.tasks.velocity.black.camera_depth import (
+    add_camera_observations,
+    depth_camera_cfg,
+)
 from alldog_mjlab.tasks.velocity.black.curriculums import (
     CURRICULUM_TERM_NAME,
     ForwardSpeedCommandCurriculum,
@@ -53,13 +71,13 @@ from alldog_mjlab.tasks.velocity.black.rewards import (
     base_height_l2_flat,
     base_height_l2_terrain,
     dof_acc_l2,
+    foot_clearance,
     joint_power_l1,
     track_angular_velocity_z,
     track_linear_velocity_xy,
     vertical_linear_velocity_l2,
 )
-from alldog_mjlab.tasks.velocity.black.terminations import StuckTermination
-from alldog_mjlab.tasks.velocity.black.terrain import black_rough_terrain_generator_cfg
+from alldog_mjlab.tasks.velocity.black.terminations import StuckTermination, bad_sim_state
 
 # ---------------------------------------------------------------------------
 # Interface contracts（不属于训练调参，勿当作超参数阅读）
@@ -443,6 +461,19 @@ def _configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
                 "target_height": BLACK_CONFIG.reward.base_height_target,
             },
         ),
+        # HIMLoco-style foot clearance: only moving/swing feet are penalized.
+        "foot_clearance": RewardTermCfg(
+            func=foot_clearance,
+            weight=BLACK_CONFIG.reward.scales.foot_clearance,
+            params={
+                "target_height": BLACK_CONFIG.reward.clearance_height_target,
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    site_names=BLACK_FOOT_NAMES,
+                    preserve_order=True,
+                ),
+            },
+        ),
         # Regularization。
         "dof_acc": RewardTermCfg(
             func=dof_acc_l2,
@@ -628,14 +659,23 @@ def _configure_observations(cfg: ManagerBasedRlEnvCfg) -> None:
     }
     for term_name in BLACK_ACTOR_OBS_TERM_ORDER:
         noise_range = actor_noise.get(term_name)
+        # Deployment clips the *scaled* concatenated obs to +/-clip_obs, while
+        # mjlab clips each term before scaling -> clip the raw term at
+        # clip_obs / max(scale) so the scaled value stays inside the deployment
+        # bound.  This bounds the last-action feedback loop in rare states.
+        scale = BLACK_ACTOR_OBS_SCALE[term_name]
+        max_scale = max(scale) if isinstance(scale, tuple) else scale
+        clip_obs = BLACK_CONFIG.observation.actor_obs_clip
+        clip_bound = clip_obs / max_scale if clip_obs > 0 else 0.0
         cfg.observations["actor"].terms[term_name] = replace(
             actor_terms[term_name],
-            scale=BLACK_ACTOR_OBS_SCALE[term_name],
+            scale=scale,
             noise=(
                 UniformNoiseCfg(n_min=noise_range[0], n_max=noise_range[1])
                 if noise_range is not None
                 else None
             ),
+            clip=(-clip_bound, clip_bound) if clip_obs > 0 else None,
         )
     cfg.observations["actor"].enable_corruption = (
         BLACK_CONFIG.observation.actor_corruption_enabled and BLACK_CONFIG.noise.enabled
@@ -675,6 +715,17 @@ def _configure_terminations(cfg: ManagerBasedRlEnvCfg) -> None:
             "velocity_threshold": BLACK_CONFIG.termination.stuck_velocity_threshold,
             "grace_s": BLACK_CONFIG.termination.stuck_grace,
             "timeout_s": BLACK_CONFIG.termination.stuck_timeout,
+        },
+    )
+    # 数值安全终止：物理状态非有限或速度极端时 reset，切断 NaN -> CUDA 710 链条。
+    # 阈值来自 TerminationParams；play 模式在 _configure_play() 里移除。
+    cfg.terminations["bad_sim_state"] = TerminationTermCfg(
+        func=bad_sim_state,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "max_joint_vel": BLACK_CONFIG.termination.max_joint_vel,
+            "max_root_ang_vel": BLACK_CONFIG.termination.max_root_ang_vel,
+            "max_root_lin_vel": BLACK_CONFIG.termination.max_root_lin_vel,
         },
     )
     cfg.terminations.pop("out_of_terrain_bounds", None)
@@ -725,6 +776,7 @@ def _configure_play(cfg: ManagerBasedRlEnvCfg) -> None:
     cfg.observations["actor"].enable_corruption = False
     cfg.terminations.pop("illegal_contact", None)
     cfg.terminations.pop("out_of_terrain_bounds", None)
+    cfg.terminations.pop("bad_sim_state", None)
     for event_name in (
         "foot_friction",
         "payload_mass",
@@ -787,6 +839,45 @@ def _build_black_env_cfg(play: bool, rough: bool) -> ManagerBasedRlEnvCfg:
     return cfg
 
 
+def black_gravel_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    """Flat + settled-gravel proxy task (no stairs / no discrete obstacles).
+
+    Uses the rough reward/termination wiring (terrain-relative base height and
+    out-of-bounds) but a much easier generator.  It is the training task for the
+    "flat including gravel" gate; the actor contract is unchanged.
+    """
+    cfg = _build_black_env_cfg(play=play, rough=True)
+    assert cfg.scene.terrain is not None
+    cfg.scene.terrain.terrain_type = "generator"
+    cfg.scene.terrain.terrain_generator = black_gravel_flat_terrain_generator_cfg()
+    cfg.scene.terrain.max_init_terrain_level = 2
+    return cfg
+
+
+def black_gravel_free_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    """Flat scene with dynamic free-joint stones for small-batch S1b fine-tuning.
+
+    The fixed heightfield task ``black-gravel-flat`` is the batch pretraining
+    path.  This task adds a few dozen free-joint stones per world and is meant
+    for 16-64 envs only; 4096 envs is intentionally unsupported.
+    """
+    cfg = _build_black_env_cfg(play=play, rough=False)
+    cfg.scene.spec_fn = add_free_gravel_bed
+    # Free stones add contacts/constraints; 128/256 leaves headroom for 64 envs.
+    cfg.sim.nconmax = 2048
+    cfg.sim.njmax = 4096
+    # The generic illegal_contact sensor only watches terrain; on stones the robot
+    # can tip over without triggering it.  Add an explicit orientation termination
+    # for training; play/eval keeps the episode continuous so a video/eval tool can
+    # detect the fall itself.
+    if not play:
+        cfg.terminations["bad_orientation"] = TerminationTermCfg(
+            func=mdp.bad_orientation,
+            params={"limit_angle": 1.0},
+        )
+    return cfg
+
+
 def black_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     """Create the flat-ground velocity task for Black.
 
@@ -834,4 +925,156 @@ def black_rough_him_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg = black_rough_env_cfg(play=play)
     configure_him_observations(cfg)
     configure_him_terminal_targets(cfg)
+    return cfg
+
+
+def black_basic_obstacle_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    """P1: flat + smooth slopes + stairs, no rough/discrete obstacles.
+
+    Reuses black-rough's reward/termination/terrain-scan wiring; only the
+    generator and initial level are replaced.  Actor contract remains flat's
+    45-D single frame.
+    """
+    cfg = _build_black_env_cfg(play=play, rough=True)
+    assert cfg.scene.terrain is not None
+    cfg.scene.terrain.terrain_type = "generator"
+    cfg.scene.terrain.terrain_generator = black_basic_obstacle_terrain_generator_cfg()
+    cfg.scene.terrain.max_init_terrain_level = 1
+    return cfg
+
+
+def black_basic_obstacle_depth_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    """P1 terrain + simulated front depth camera (C2 vision mainline).
+
+    Same terrain / reward / termination wiring as ``black-basic-obstacle``; the
+    only additions are the depth camera sensor (rendered on GPU through
+    mujoco_warp) and a 2-D ``camera`` observation group.  The actor is expected to
+    be an ``rsl_rl`` ``CNNModel`` that takes the 45-D proprio group plus the CNN
+    latent (see ``rl_cfg.black_depth_ppo_runner_cfg``); the critic keeps the 259-D
+    privileged layout.
+
+    The blind task is left untouched so the blind policy stays a fallback.
+    """
+    cfg = black_basic_obstacle_env_cfg(play=play)
+    cfg.scene.sensors = (cfg.scene.sensors or ()) + (depth_camera_cfg(),)
+    add_camera_observations(cfg, enable_corruption=not play)
+    return cfg
+
+
+def black_competition_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    """Competition-proxy terrain: flat/slope/stairs + Part1/Part2 obstacles.
+
+    Uses the same actor/reward/termination/command/DR contract as
+    ``black-basic-obstacle`` (45-D blind actor); only the terrain generator is
+    replaced by the obstacle-proxy curriculum in ``competition_terrain.py``.
+    """
+    cfg = _build_black_env_cfg(play=play, rough=True)
+    assert cfg.scene.terrain is not None
+    cfg.scene.terrain.terrain_type = "generator"
+    generator = black_competition_terrain_generator_cfg()
+    cfg.scene.terrain.terrain_generator = generator
+    # Train starts at easy rows and climbs the curriculum; play/rollout samples
+    # the full difficulty range so preview videos reach the obstacle rows.
+    # Distance-based terrain curriculum is incompatible with goal-terminated
+    # obstacle episodes (early success shows as "not enough walked distance" and
+    # four course columns stayed at level 0 in the stage-3 run).  Fix the
+    # difficulty distribution instead: training samples rows 0..4 (d=0.0..0.8),
+    # play samples all rows.
+    cfg.scene.terrain.max_init_terrain_level = (
+        generator.num_rows - 1 if play else min(3, generator.num_rows - 1)
+    )
+    # Obstacle courses are a traversal task, not random velocity tracking: command
+    # a constant forward speed and disable the command curriculum (the terrain
+    # curriculum still runs).  Fixed forward commands also make the goal-progress
+    # reward and the local judge commands consistent.
+    command = cfg.commands[BLACK_COMMAND_NAME]
+    command.ranges.lin_vel_x = (0.4, 1.0)
+    # yaw/vy are needed for Part 1 manual driving (rl_sar joystick): the earlier
+    # fixed-forward version could not turn at all (check_walk yaw = 0).
+    command.ranges.lin_vel_y = (-0.3, 0.3)
+    command.ranges.ang_vel_z = (-1.0, 1.0)
+    command.ranges.heading = None
+    command.heading_command = False
+    command.rel_standing_envs = 0.0
+    command.rel_heading_envs = 0.0
+    command.rel_forward_envs = 1.0
+    cfg.curriculum.pop(CURRICULUM_TERM_NAME, None)
+    if not play:
+        cfg.curriculum.pop("terrain_levels", None)
+    if not play:
+        # Obstacle tasks require body/leg contact with walls, beams and stones
+        # (climbing, crawling, pass-under).  The generic rough-task illegal
+        # contact (trunk/thigh vs terrain) and stuck terms would abort exactly
+        # those attempts, so replace them with a fall/orientation termination.
+        cfg.terminations.pop("illegal_contact", None)
+        cfg.terminations.pop("stuck", None)
+        cfg.terminations["bad_orientation"] = TerminationTermCfg(
+            func=mdp.bad_orientation,
+            params={"limit_angle": 1.05},
+        )
+        # Dense goal progress + sparse success bonus + success termination.
+        # Anti-degeneracy: the first stage3 policy learned to crawl (base z 0.24,
+        # tilt 22 deg) to squeeze under the low height bar, which then transferred
+        # to every terrain and scored 0 in the real scenes.  Keep the base up.
+        cfg.rewards["base_height"] = replace(
+            cfg.rewards["base_height"], weight=-4.0
+        )
+        cfg.rewards["foot_clearance"] = replace(
+            cfg.rewards["foot_clearance"], weight=-0.03
+        )
+        cfg.rewards["competition_progress"] = RewardTermCfg(
+            func=competition_goal_progress,
+            weight=1.5,
+            params={"goal_name": "goal", "asset_cfg": SceneEntityCfg("robot")},
+        )
+        cfg.rewards["competition_goal"] = RewardTermCfg(
+            func=competition_goal_reward,
+            weight=5.0,
+            params={"goal_name": "goal", "asset_cfg": SceneEntityCfg("robot")},
+        )
+        cfg.terminations["competition_goal_reached"] = TerminationTermCfg(
+            func=competition_goal_reached,
+            params={"goal_name": "goal", "asset_cfg": SceneEntityCfg("robot")},
+        )
+        # Competition terrain is contact-heavy (walls, beams, narrow bridges); a
+        # single non-finite critic obs used to abort a 1024-env run at ~1.9k iter.
+        # Sanitize non-finite observation values and print the offending term so
+        # the underlying env bug (if any) is still diagnosable.
+        for group_name in cfg.observations:
+            cfg.observations[group_name].nan_policy = "warn"
+    return cfg
+
+
+def black_competition_depth_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    """Competition-proxy terrain + simulated front depth camera (vision line).
+
+    Same as ``black-competition`` plus the depth camera sensor and the 2-D
+    ``camera`` observation group (CNN actor, 45 + 64 dims); the critic keeps the
+    259-D privileged layout.
+    """
+    cfg = black_competition_env_cfg(play=play)
+    cfg.scene.sensors = (cfg.scene.sensors or ()) + (depth_camera_cfg(),)
+    add_camera_observations(cfg, enable_corruption=not play)
+    return cfg
+
+
+def black_competition_hist_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    """Competition terrain + 6-frame actor history (270-D blind actor).
+
+    Keeps the same action/reward/termination contract; only the actor observation
+    group gets MjLab native history (6 x 45 = 270, flattened).  The deployed
+    contract for 270-D history policies already exists (HIM-style rl_sar cfg), so
+    this is an A/B against the single-frame 45-D actor.
+    """
+    cfg = black_competition_env_cfg(play=play)
+    cfg.observations["actor"].history_length = 6
+    cfg.observations["actor"].flatten_history_dim = True
+    return cfg
+
+
+def black_competition_depth_hist_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    """Competition terrain + 6-frame proprio history + depth CNN (270 + 64)."""
+    cfg = black_competition_depth_env_cfg(play=play)
+    cfg.observations["actor"].history_length = 6
+    cfg.observations["actor"].flatten_history_dim = True
     return cfg

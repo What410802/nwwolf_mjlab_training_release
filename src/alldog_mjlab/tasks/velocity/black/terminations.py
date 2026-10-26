@@ -69,3 +69,38 @@ class StuckTermination(ManagerTermBase):
             torch.zeros_like(self._stuck_time),
         )
         return self._stuck_time > self._timeout_s
+
+
+def bad_sim_state(
+    env: ManagerBasedRlEnv,
+    asset_cfg,
+    max_joint_vel: float,
+    max_root_ang_vel: float,
+    max_root_lin_vel: float,
+) -> torch.Tensor:
+    """Terminate envs whose physics state is non-finite or numerically extreme.
+
+    This is a safety net, not a capability criterion: the observed failure chain
+    was "off-distribution fall -> action feedback through the last-action
+    observation -> huge action -> NaN physics -> CUDA 710".  Resetting such envs
+    before the next observation stops the chain while leaving normal gait
+    (``|qvel|`` well below the thresholds) untouched.
+    """
+    data = env.scene[asset_cfg.name].data
+    joint_pos = data.joint_pos
+    joint_vel = data.joint_vel
+    root_pos = data.root_link_pos_w
+    root_ang = data.root_link_ang_vel_w
+    root_lin = data.root_link_lin_vel_w
+    # Positions too: a non-finite qpos feeds the height-scan sensor and then the
+    # critic observation (observed on the competition terrain at high difficulty),
+    # while velocities can still be finite for one step.
+    bad = ~torch.isfinite(joint_pos).all(dim=1)
+    bad |= ~torch.isfinite(joint_vel).all(dim=1)
+    bad |= ~torch.isfinite(root_pos).all(dim=1)
+    bad |= ~torch.isfinite(root_ang).all(dim=1)
+    bad |= ~torch.isfinite(root_lin).all(dim=1)
+    bad |= joint_vel.abs().amax(dim=1) > max_joint_vel
+    bad |= root_ang.abs().amax(dim=1) > max_root_ang_vel
+    bad |= root_lin.abs().amax(dim=1) > max_root_lin_vel
+    return bad
