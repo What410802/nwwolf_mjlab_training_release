@@ -1,0 +1,125 @@
+"""BlackW HIM runner with an optional official TorchScript warm start.
+
+The official blackW deployment policies are HIM exports (actor + source encoder)
+and match the MjLab HIMPolicy shapes exactly.  Set
+``BLACKW_OFFICIAL_WARMSTART=/path/policy.pt`` before launching training to copy
+the actor/source-encoder tensors into the randomly initialized HIM policy.  The
+target encoder/prototypes and critic remain freshly initialized, as they are
+training-only components absent from the deployment export.
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+
+from alldog_mjlab.tasks.velocity.black.him_runner import BlackHimOnPolicyRunner
+from alldog_mjlab.utils.reward_safety import install_reward_clamp, install_return_clamp
+
+
+class _ActionGuardWrapper:
+    """Sanitize policy actions before they enter the simulator.
+
+    Action-term guards are necessary but not sufficient: PPO/HIM can emit a bad
+    vector that is used by the wrapper/observation pipeline before the term runs.
+    This wrapper is the last line before ``mjwarp.step``.
+    """
+
+    def __init__(self, env, clip_actions: float = 100.0) -> None:
+        self.env = env
+        self.clip_actions = float(clip_actions)
+        self.nonfinite_actions = 0
+        self.max_abs_action = 0.0
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    def __len__(self) -> int:
+        return len(self.env)
+
+    def step(self, action):
+        if not torch.isfinite(action).all():
+            self.nonfinite_actions += int((~torch.isfinite(action)).sum().item())
+            action = torch.nan_to_num(action, nan=0.0, posinf=self.clip_actions, neginf=-self.clip_actions)
+        action = torch.clamp(action, -self.clip_actions, self.clip_actions)
+        self.max_abs_action = max(self.max_abs_action, float(action.abs().max().item()))
+        return self.env.step(action)
+
+
+def _map_official(policy, path: str) -> None:
+    official = torch.jit.load(path, map_location="cpu").eval()
+    mapped = {}
+    for name, value in official.named_parameters():
+        if name.startswith("actor."):
+            target = "mlp." + name[len("actor."):]
+        elif name.startswith("estimator."):
+            target = "estimator.encoder." + name[len("estimator."):]
+        else:
+            raise ValueError(f"unexpected official parameter: {name}")
+        mapped[target] = value
+    missing, unexpected = policy.load_state_dict(mapped, strict=False)
+    print(
+        f"[INFO] official warm start: {path} mapped={len(mapped)} "
+        f"missing={missing} unexpected={unexpected}"
+    )
+
+
+class BlackWHimOfficialRunner(BlackHimOnPolicyRunner):
+    def __init__(self, env, train_cfg, log_dir=None, device="cpu", **kwargs):
+        clip = float(
+            (train_cfg.get("clip_actions") if isinstance(train_cfg, dict) else getattr(train_cfg, "clip_actions", 100.0))
+            or 100.0
+        )
+        if not isinstance(env, _ActionGuardWrapper):
+            env = _ActionGuardWrapper(env, clip_actions=clip)
+        super().__init__(env, train_cfg, log_dir, device, **kwargs)
+        reward_clip = float(os.environ.get("BLACKW_REWARD_CLIP", "50.0"))
+        install_reward_clamp(self.env.unwrapped, reward_clip)
+        install_return_clamp(self.alg)
+        # This MUST be inside __init__.  An earlier patch accidentally left it
+        # after ``return super().save(...)``, so warm-start silently never ran.
+        path = os.environ.get("BLACKW_OFFICIAL_WARMSTART")
+        if path:
+            _map_official(self.alg.actor, path)
+            # The deployment export has no distribution.std_param; keep this
+            # visible instead of silently treating the warm start as complete.
+            dist = self.alg.actor.distribution
+            std_param = getattr(dist, "log_std_param", None) if dist is not None else None
+            if std_param is not None:
+                print(
+                    "[WARN] official warm start does not restore action std; "
+                    f"current std≈{float(torch.exp(std_param.detach()).mean()):.4f} "
+                    f"(BLACKW_HIM_INIT_STD={os.environ.get('BLACKW_HIM_INIT_STD', '0.1')})"
+                )
+            self.alg.set_policy_anchor()
+        freeze_std = os.environ.get("BLACKW_HIM_FREEZE_STD", "")
+        if freeze_std:
+            dist = self.alg.actor.distribution
+            param = getattr(dist, "log_std_param", None) if dist is not None else None
+            if param is not None:
+                if freeze_std == "precheck":
+                    with torch.no_grad():
+                        param.fill_(-10.0)
+                    print("[INFO] HIM std frozen to precheck value (std≈0)")
+                else:
+                    param.requires_grad_(False)
+                    print("[INFO] HIM std frozen at warm-start/init value")
+
+    def save(self, path, infos=None):
+        try:
+            raw = self.env.unwrapped
+            sim = raw.sim
+            data = sim.data
+            nefc = getattr(data, "nefc", None)
+            overflow = getattr(data, "overflow", None)
+            nefc_max = int(nefc.max().item()) if nefc is not None else -1
+            overflow_n = int((overflow != 0).sum().item()) if overflow is not None else -1
+            print(
+                f"[HIM guard] nefc_max={nefc_max} overflow_nonzero={overflow_n} "
+                f"nonfinite_actions={self.env.nonfinite_actions} "
+                f"max_abs_action={self.env.max_abs_action:.3f}"
+            )
+            self.env.nonfinite_actions = 0
+        except Exception as exc:  # noqa: BLE001 - monitoring must never stop training
+            print(f"[HIM guard] monitor unavailable: {type(exc).__name__}: {exc}")
+        return super().save(path, infos)
